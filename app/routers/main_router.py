@@ -6,14 +6,14 @@ from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from app.models.schemas import TextInput, FinalPipelineOutput
 from app.services.ai_service import four_step_extractor
 
-router = APIRouter(prefix="/api/v1", tags=["4-Step Amount Extraction"])
+router = APIRouter(prefix="/api/v1", tags=["Amount Extraction"])
 
 
 @router.post("/extract-from-image", response_model=FinalPipelineOutput)
 async def extract_from_image(
     file: UploadFile = File(...)
 ) -> FinalPipelineOutput:
-    """Extract amounts from uploaded image using 4-step AI pipeline."""
+    """Extract amounts from uploaded image using AI pipeline."""
     try:
         # Validate file type
         if not file.content_type or not file.content_type.startswith("image/"):
