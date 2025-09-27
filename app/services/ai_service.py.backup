@@ -1,0 +1,502 @@
+"""4-step amount extraction pipeline using AI."""
+
+import json
+import re
+import base64
+import io
+from typing import List, Dict, Any, Optional, Tuple
+from PIL import Image
+import google.generativeai as genai
+from app.config import settings
+from app.models.schemas import (
+    OCROutput, NormalizationOutput, ClassificationOutput, 
+    FinalPipelineOutput, FinalAmount, ClassifiedAmount
+)
+
+
+class FourStepAmountExtractor:
+    """4-step pipeline: OCR → Normalization → Classification → Final Output."""
+    
+    def __init__(self):
+        """Initialize the AI service."""
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        self.model = genai.GenerativeModel(settings.GEMINI_MODEL)
+        
+        # OCR error correction patterns
+        self.ocr_corrections = {
+            'l': '1', 'I': '1', '|': '1', 'i': '1',
+            'O': '0', 'o': '0', 'Q': '0',
+            'S': '5', 's': '5', 'G': '6', 'g': '6',
+            'T': '7', 't': '7', 'B': '8', 'b': '8'
+        }
+    
+    def extract_from_image(self, image_data: bytes) -> FinalPipelineOutput:
+        """Complete 4-step pipeline from image input."""
+        try:
+            # Process image to extract text
+            image = Image.open(io.BytesIO(image_data))
+            
+            # Use AI to extract text from image first
+            ocr_prompt = """
+            Extract ALL text from this medical document image. Focus on:
+            - Any numbers that could be amounts
+            - Currency symbols (₹, Rs, $, etc.)
+            - Context words (total, paid, due, discount, etc.)
+            
+            Return the raw extracted text exactly as you see it, including any OCR errors.
+            """
+            
+            response = self.model.generate_content([image, ocr_prompt])
+            extracted_text = response.text
+            
+            # Run 4-step pipeline on extracted text
+            return self._run_complete_pipeline(extracted_text)
+            
+        except Exception as e:
+            # Return error in pipeline format
+            return FinalPipelineOutput(
+                currency=None,
+                amounts=[],
+                status="error",
+                reason=f"Image processing error: {str(e)}",
+                ocr_step=OCROutput(raw_tokens=[], confidence=0.0, status="no_amounts_found"),
+                normalization_step=NormalizationOutput(normalized_amounts=[], normalization_confidence=0.0),
+                classification_step=ClassificationOutput(amounts=[], confidence=0.0)
+            )
+    
+    def extract_from_text(self, text: str) -> FinalPipelineOutput:
+        """Complete 4-step pipeline from text input."""
+        return self._run_complete_pipeline(text)
+    
+    def _run_complete_pipeline(self, input_text: str) -> FinalPipelineOutput:
+        """Run all 4 steps of the pipeline."""
+        try:
+            # Step 1: OCR/Token Extraction
+            ocr_result = self._step1_ocr_extraction(input_text)
+            
+            if ocr_result.status == "no_amounts_found":
+                return FinalPipelineOutput(
+                    currency=None,
+                    amounts=[],
+                    status="no_amounts_found",
+                    reason=ocr_result.reason,
+                    ocr_step=ocr_result,
+                    normalization_step=NormalizationOutput(normalized_amounts=[], normalization_confidence=0.0),
+                    classification_step=ClassificationOutput(amounts=[], confidence=0.0)
+                )
+            
+            # Step 2: Normalization
+            norm_result = self._step2_normalization(ocr_result.raw_tokens)
+            
+            # Step 3: Classification
+            class_result = self._step3_classification(input_text, norm_result.normalized_amounts)
+            
+            # Step 4: Final Output
+            final_result = self._step4_final_output(
+                input_text, ocr_result.currency_hint, class_result.amounts
+            )
+            
+            return FinalPipelineOutput(
+                currency=final_result["currency"],
+                amounts=final_result["amounts"],
+                status="ok",
+                ocr_step=ocr_result,
+                normalization_step=norm_result,
+                classification_step=class_result
+            )
+            
+        except Exception as e:
+            return FinalPipelineOutput(
+                currency=None,
+                amounts=[],
+                status="error",
+                reason=f"Pipeline error: {str(e)}",
+                ocr_step=OCROutput(raw_tokens=[], confidence=0.0, status="no_amounts_found"),
+                normalization_step=NormalizationOutput(normalized_amounts=[], normalization_confidence=0.0),
+                classification_step=ClassificationOutput(amounts=[], confidence=0.0)
+            )
+    
+    def _step1_ocr_extraction(self, text: str) -> OCROutput:
+        """Step 1: Extract raw numeric tokens and currency hints."""
+        try:
+            prompt = f"""
+            Analyze this medical document text and extract ONLY the numeric tokens that could represent amounts.
+            
+            TEXT: {text}
+            
+            TASK: Extract raw numeric tokens exactly as they appear (including any OCR errors).
+            
+            Look for:
+            - Numbers that could be amounts (even if they have OCR errors like "l200" or "1O00")
+            - Currency symbols or abbreviations (₹, Rs, INR, $, USD, etc.)
+            - Percentage signs that might indicate discounts
+            
+            RETURN ONLY valid JSON in this exact format:
+            {{
+                "raw_tokens": ["1200", "1000", "200", "10%"],
+                "currency_hint": "INR",
+                "confidence": 0.74,
+                "status": "ok"
+            }}
+            
+            If no amounts found, return:
+            {{
+                "raw_tokens": [],
+                "currency_hint": null,
+                "confidence": 0.0,
+                "status": "no_amounts_found",
+                "reason": "document too noisy"
+            }}
+            """
+            
+            response = self.model.generate_content(prompt)
+            result = json.loads(self._clean_json_response(response.text))
+            
+            return OCROutput(
+                raw_tokens=result.get("raw_tokens", []),
+                currency_hint=result.get("currency_hint"),
+                confidence=result.get("confidence", 0.0),
+                status=result.get("status", "ok"),
+                reason=result.get("reason")
+            )
+            
+        except Exception as e:
+            return OCROutput(
+                raw_tokens=[],
+                confidence=0.0,
+                status="no_amounts_found",
+                reason=f"OCR extraction failed: {str(e)}"
+            )
+    
+    def _step2_normalization(self, raw_tokens: List[str]) -> NormalizationOutput:
+        """Step 2: Fix OCR errors and normalize to clean numbers."""
+        try:
+            if not raw_tokens:
+                return NormalizationOutput(
+                    normalized_amounts=[],
+                    normalization_confidence=0.0,
+                    corrections_made=[]
+                )
+            
+            normalized_amounts = []
+            corrections_made = []
+            
+            for token in raw_tokens:
+                # Skip percentage values
+                if '%' in token:
+                    continue
+                
+                # Apply OCR corrections
+                corrected_token = token
+                token_corrections = []
+                
+                for error_char, correct_char in self.ocr_corrections.items():
+                    if error_char in corrected_token:
+                        old_token = corrected_token
+                        corrected_token = corrected_token.replace(error_char, correct_char)
+                        if old_token != corrected_token:
+                            token_corrections.append({
+                                "original": old_token,
+                                "corrected": corrected_token,
+                                "rule": f"{error_char} → {correct_char}"
+                            })
+                
+                # Extract numeric value
+                numeric_match = re.search(r'[\d.,]+', corrected_token.replace(',', ''))
+                if numeric_match:
+                    try:
+                        value = float(numeric_match.group().replace(',', ''))
+                        if settings.MIN_AMOUNT <= value <= settings.MAX_AMOUNT:
+                            normalized_amounts.append(value)
+                            if token_corrections:
+                                corrections_made.extend(token_corrections)
+                    except ValueError:
+                        continue
+            
+            confidence = min(1.0, len(normalized_amounts) / max(1, len(raw_tokens)))
+            
+            return NormalizationOutput(
+                normalized_amounts=normalized_amounts,
+                normalization_confidence=confidence,
+                corrections_made=corrections_made
+            )
+            
+        except Exception as e:
+            return NormalizationOutput(
+                normalized_amounts=[],
+                normalization_confidence=0.0,
+                corrections_made=[],
+            )
+    
+    def _step3_classification(self, original_text: str, amounts: List[float]) -> ClassificationOutput:
+            
+            # AI prompt for comprehensive analysis
+            prompt = self._get_analysis_prompt()
+            
+            # Generate response
+            response = self.model.generate_content([image, prompt])
+            
+            # Parse AI response
+            return self._parse_ai_response(response.text)
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"AI processing error: {str(e)}",
+                "amounts": []
+            }
+    
+    def extract_from_text(self, text: str) -> Dict[str, Any]:
+        """Extract amounts from text using AI."""
+        try:
+            # AI prompt for text analysis
+            prompt = self._get_text_analysis_prompt(text)
+            
+            # Generate response
+            response = self.model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=settings.GEMINI_TEMPERATURE,
+                    max_output_tokens=settings.GEMINI_MAX_TOKENS,
+                )
+            )
+            
+            # Parse AI response
+            return self._parse_ai_response(response.text)
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"AI text processing error: {str(e)}",
+                "amounts": []
+            }
+    
+    def _get_analysis_prompt(self) -> str:
+        """Get AI prompt for image analysis."""
+        return f"""
+        Analyze this medical document image and extract ALL monetary amounts with their context.
+        
+        TASK: Extract amounts from medical bills, prescriptions, or healthcare documents.
+        
+        REQUIREMENTS:
+        1. Find ALL monetary amounts (₹, Rs, $, €, £, etc.)
+        2. Identify the type and context for each amount
+        3. Extract exact numerical values
+        4. Determine confidence level (0.0-1.0)
+        5. Validate amounts are reasonable ({settings.MIN_AMOUNT}-{settings.MAX_AMOUNT})
+        
+        AMOUNT TYPES TO IDENTIFY:
+        - total_bill: Final total amount, grand total
+        - consultation: Doctor fees, visit charges
+        - medicine: Medication costs, pharmacy bills  
+        - test: Lab tests, investigations, scans
+        - paid: Amounts already paid, advance
+        - due: Balance due, pending amount
+        - tax: GST, VAT, service tax
+        - discount: Discounts, offers, rebates
+        
+        OUTPUT FORMAT (JSON):
+        {{
+            "success": true,
+            "amounts": [
+                {{
+                    "value": 250.0,
+                    "currency": "INR", 
+                    "type": "consultation",
+                    "context": "Doctor consultation fee",
+                    "confidence": 0.95,
+                    "raw_text": "Dr. Fee: ₹250"
+                }}
+            ],
+            "summary": {{
+                "total_found": 1,
+                "highest_confidence": 0.95,
+                "primary_amount": 250.0,
+                "primary_type": "consultation"
+            }}
+        }}
+        
+        IMPORTANT:
+        - Only include amounts above ₹{settings.MIN_AMOUNT}
+        - Return valid JSON only
+        - Include confidence scores
+        - Default currency: {settings.DEFAULT_CURRENCY}
+        """
+    
+    def _get_text_analysis_prompt(self, text: str) -> str:
+        """Get AI prompt for text analysis."""
+        return f"""
+        Analyze this medical document text and extract ALL monetary amounts with their context.
+        
+        TEXT TO ANALYZE:
+        {text}
+        
+        TASK: Extract amounts from medical bills, prescriptions, or healthcare documents.
+        
+        REQUIREMENTS:
+        1. Find ALL monetary amounts (₹, Rs, $, €, £, numbers with currency context)
+        2. Identify the type and context for each amount
+        3. Extract exact numerical values
+        4. Determine confidence level (0.0-1.0)
+        5. Validate amounts are reasonable ({settings.MIN_AMOUNT}-{settings.MAX_AMOUNT})
+        
+        AMOUNT TYPES TO IDENTIFY:
+        - total_bill: Final total amount, grand total
+        - consultation: Doctor fees, visit charges
+        - medicine: Medication costs, pharmacy bills  
+        - test: Lab tests, investigations, scans
+        - paid: Amounts already paid, advance
+        - due: Balance due, pending amount
+        - tax: GST, VAT, service tax
+        - discount: Discounts, offers, rebates
+        
+        OUTPUT FORMAT (JSON):
+        {{
+            "success": true,
+            "amounts": [
+                {{
+                    "value": 250.0,
+                    "currency": "INR", 
+                    "type": "consultation",
+                    "context": "Doctor consultation fee",
+                    "confidence": 0.95,
+                    "raw_text": "Dr. Fee: ₹250"
+                }}
+            ],
+            "summary": {{
+                "total_found": 1,
+                "highest_confidence": 0.95,
+                "primary_amount": 250.0,
+                "primary_type": "consultation"
+            }}
+        }}
+        
+        IMPORTANT:
+        - Only include amounts above ₹{settings.MIN_AMOUNT}
+        - Return valid JSON only
+        - Include confidence scores
+        - Default currency: {settings.DEFAULT_CURRENCY}
+        """
+    
+    def _parse_ai_response(self, response_text: str) -> Dict[str, Any]:
+        """Parse AI response and extract structured data."""
+        try:
+            # Clean response text
+            cleaned_text = self._clean_json_response(response_text)
+            
+            # Parse JSON
+            result = json.loads(cleaned_text)
+            
+            # Validate and process amounts
+            if "amounts" in result:
+                result["amounts"] = self._validate_amounts(result["amounts"])
+            
+            # Ensure required fields
+            if "success" not in result:
+                result["success"] = len(result.get("amounts", [])) > 0
+            
+            return result
+            
+        except json.JSONDecodeError as e:
+            # Fallback: Try to extract amounts using regex
+            return self._fallback_extraction(response_text)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Response parsing error: {str(e)}",
+                "amounts": []
+            }
+    
+    def _clean_json_response(self, text: str) -> str:
+        """Clean AI response to extract valid JSON."""
+        # Remove markdown code blocks
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*$', '', text)
+        
+        # Find JSON object
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json_match.group(0)
+        
+        return text.strip()
+    
+    def _validate_amounts(self, amounts: List[Dict]) -> List[Dict]:
+        """Validate and filter amounts."""
+        valid_amounts = []
+        
+        for amount in amounts:
+            try:
+                value = float(amount.get("value", 0))
+                confidence = float(amount.get("confidence", 0))
+                
+                # Validate range and confidence
+                if (settings.MIN_AMOUNT <= value <= settings.MAX_AMOUNT and 
+                    confidence >= settings.MIN_CONFIDENCE):
+                    
+                    # Ensure required fields
+                    amount["value"] = value
+                    amount["confidence"] = confidence
+                    amount["currency"] = amount.get("currency", settings.DEFAULT_CURRENCY)
+                    amount["type"] = amount.get("type", "unknown")
+                    amount["context"] = amount.get("context", "")
+                    
+                    valid_amounts.append(amount)
+                    
+            except (ValueError, TypeError):
+                continue
+        
+        return valid_amounts
+    
+    def _fallback_extraction(self, text: str) -> Dict[str, Any]:
+        """Fallback amount extraction using regex."""
+        try:
+            # Basic amount patterns
+            amount_patterns = [
+                r'₹\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',
+                r'Rs\.?\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',
+                r'INR\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',
+                r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',
+                r'(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(?:₹|Rs|INR)'
+            ]
+            
+            amounts = []
+            for pattern in amount_patterns:
+                matches = re.finditer(pattern, text, re.IGNORECASE)
+                for match in matches:
+                    try:
+                        value_str = match.group(1).replace(',', '')
+                        value = float(value_str)
+                        
+                        if settings.MIN_AMOUNT <= value <= settings.MAX_AMOUNT:
+                            amounts.append({
+                                "value": value,
+                                "currency": settings.DEFAULT_CURRENCY,
+                                "type": "unknown",
+                                "context": match.group(0),
+                                "confidence": 0.6,
+                                "raw_text": match.group(0)
+                            })
+                    except ValueError:
+                        continue
+            
+            return {
+                "success": len(amounts) > 0,
+                "amounts": amounts,
+                "summary": {
+                    "total_found": len(amounts),
+                    "highest_confidence": max([a["confidence"] for a in amounts]) if amounts else 0,
+                    "primary_amount": amounts[0]["value"] if amounts else 0,
+                    "primary_type": amounts[0]["type"] if amounts else "unknown"
+                }
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Fallback extraction error: {str(e)}",
+                "amounts": []
+            }
+
+
+# Global service instance
+ai_extractor = AIAmountExtractor()
